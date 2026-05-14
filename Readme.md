@@ -6,15 +6,6 @@ editor_options:
 
 # Proposal for Semester Project
 
-```{=html}
-<!-- 
-Please render a pdf version of this Markdown document with the command below (in your bash terminal) and push this file to Github. 
-Please do not Rename this file (Readme.md has a special meaning on GitHub).
-
-quarto render Readme.md --to pdf
--->
-```
-
 **Patterns & Trends in Environmental Data / Computational Movement Analysis / Geo 880**
 
 | Semester:    | FS26                                                  |
