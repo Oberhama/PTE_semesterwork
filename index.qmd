@@ -1,7 +1,7 @@
 ---
-title: The title of your Semesterproject
-subtitle: A subtle subtitle
-author: Firstname1 Lastname1 and Firstname2 Lastname2
+title: Efficency of Trajectories on Different Spacial Scales
+subtitle: Analysis of the GeoLife Trajectory Dataset
+author: Manuel Oberhänsli
 format:
   html:
     code-fold: true
@@ -10,35 +10,693 @@ execute:
   message: false
 lang: en  # switch to "de" if you write your report in german
 bibliography: bibliography.bib
+editor: 
+  markdown: 
+    wrap: 72
 ---
 
 ```{r preprocessing}
 #| code-summary: preprocessing
+#| eval: false
 
-``` 
+library(tidyr)
+library(readr)
+library(sf)
+library(tmap)
+library(purrr)
+library(ggplot2)
+library(dplyr)
 
+
+### READ ALL FILES ###
+
+# get all .plt files
+files <- list.files(
+  "Data/Raw",
+  pattern = "\\.plt$",
+  full.names = TRUE
+)
+
+# read all files into separate variables
+counter <- 1
+
+for(i in seq_along(files)) {
+  
+  # read trajectory first
+  traj <- read_csv(
+    files[i],
+    skip = 6,
+    col_names = c(
+      "lat",
+      "lon",
+      "unused",
+      "altitude_ft",
+      "days",
+      "date",
+      "time"
+    ),
+    show_col_types = FALSE
+  ) %>%
+    mutate(
+      datetime = as.POSIXct(
+        paste(date, time),
+        format = "%Y-%m-%d %H:%M:%S",
+        tz = "UTC"
+      )
+    )
+  
+  # skip files with more than 5000 rows
+  if(nrow(traj) > 5000) {
+    cat("Skipping", files[i], "- too many rows\n")
+    next
+  }
+  
+  # create variable name only for kept trajectories
+  obj_name <- sprintf("traj_%03d", counter)
+  
+  # assign into global environment
+  assign(obj_name, traj)
+  
+  counter <- counter + 1
+}
+
+
+### VISUALIZE ALL TRAJECTORIES ###
+traj_names <- ls(pattern = "^traj_")
+
+# convert all trajectories to sf LINESTRINGs
+traj_lines <- map(
+  traj_names,
+  function(x) {
+    
+    traj <- get(x)
+    
+    # convert to sf points
+    traj_sf <- st_as_sf(
+      traj,
+      coords = c("lon", "lat"),
+      crs = 4326
+    )
+    
+    # convert points to line
+    traj_line <- traj_sf %>%
+      summarise(do_union = FALSE) %>%
+      st_cast("LINESTRING")
+    
+    traj_line$trajectory <- x
+    
+    traj_line
+  }
+)
+
+# combine all lines into one sf object
+traj_all <- do.call(rbind, traj_lines)
+
+# interactive mode
+tmap_mode("view")
+
+# map
+tm_shape(traj_all) +
+  tm_lines(
+    col = "blue",
+    lwd = 2
+  )
+
+
+### EXTRACT ACTIVE TRAVEL PARTS ###
+
+timeToNextPoint5min <- function(traj_x) {
+  # make sure ordered by time
+  traj_x <- traj_x[order(traj_x$datetime), ]
+  n <- nrow(traj_x)
+  # output vector
+  time_to_next_5min <- rep(NA_real_, n)
+  for(i in 1:n) {
+    current_time <- traj_x$datetime[i]
+    # time differences in seconds
+    diffs <- as.numeric(
+      difftime(
+        traj_x$datetime[(i+1):n],
+        current_time,
+        units = "secs"
+      )
+    )
+    # first point at least 5 min (=300 sec) ahead
+    idx <- which(diffs >= 300)[1]
+    if(!is.na(idx)) {
+      time_to_next_5min[i] <- diffs[idx]
+    }
+  }
+  # add column
+  traj_x$timeToNextPoint5min_sec <- time_to_next_5min
+  return(traj_x)
+}
+
+distToNextPoint5min <- function(traj_x) {
+  # make sure ordered by time
+  traj_x <- traj_x[order(traj_x$datetime), ]
+  n <- nrow(traj_x)
+  # output vector
+  time_to_next_5min <- rep(NA_real_, n)
+  for(i in 1:n) {
+    current_time <- traj_x$datetime[i]
+    # time differences in seconds
+    diffs <- as.numeric(
+      difftime(
+        traj_x$datetime[(i+1):n],
+        current_time,
+        units = "secs"
+      )
+    )
+    # first point at least 5 min (=300 sec) ahead
+    idx <- which(diffs >= 300)[1]
+    if(!is.na(idx)) {
+      time_to_next_5min[i] <- diffs[idx]
+    }
+  }
+  # add column
+  traj_x$timeToNextPoint5min_sec <- time_to_next_5min
+  return(traj_x)
+}
+
+distToNextPoint5min <- function(traj_x) {
+  # ensure ordering
+  traj_x <- traj_x[order(traj_x$datetime), ]
+  n <- nrow(traj_x)
+  # output vector (meters)
+  dist_to_next_5min <- rep(NA_real_, n)
+  # convert to sf points (WGS84)
+  sf_pts <- st_as_sf(traj_x, coords = c("lon", "lat"), crs = 4326)
+  # loop over points
+  for(i in 1:n) {
+    current_time <- traj_x$datetime[i]
+    # find future points
+    future_idx <- which(traj_x$datetime > current_time)
+    if(length(future_idx) == 0) next
+    # time diffs (seconds)
+    dt <- as.numeric(difftime(traj_x$datetime[future_idx],
+                              current_time,
+                              units = "secs"))
+    # first index >= 5 minutes
+    j <- which(dt >= 300)[1]
+    if(!is.na(j)) {
+      target_idx <- future_idx[j]
+      # distance in meters using sf
+      dist <- st_distance(sf_pts[i, ], sf_pts[target_idx, ], by_element = TRUE)
+      dist_to_next_5min[i] <- as.numeric(dist)
+    }
+  }
+  traj_x$distToNextPoint5min_m <- dist_to_next_5min
+  return(traj_x)
+}
+
+speedToNextPoint5min <- function(traj_x){
+  traj_x$speedToNextPoint5min_ms <- traj_x$distToNextPoint5min_m / traj_x$timeToNextPoint5min_sec
+  traj_x$distToNextPoint5min_m[is.na(traj_x$speedToNextPoint5min_ms)] <- NA
+  return(traj_x)
+}
+
+# speed threashold: 0.833 m/s (=3km/h)
+travelling <- function(traj_x) {
+  traj_x$travelling <- traj_x$speedToNextPoint5min_ms >= 0.833
+  traj_x$travelling[is.na(traj_x$speedToNextPoint5min_ms)] <- NA
+  
+  return(traj_x)
+}
+
+extractMovingSegment <- function(traj_x) {
+  # find all TRUE positions
+  moving_idx <- which(traj_x$travelling == TRUE)
+  # if no movement exists
+  if(length(moving_idx) == 0) {
+    return(NULL)
+  }
+  # first moving point
+  start_idx <- moving_idx[1]
+  # find first FALSE after movement started
+  after_start <- traj_x$travelling[start_idx:nrow(traj_x)]
+  end_false <- which(after_start == FALSE)[1]
+  # determine end index
+  if(is.na(end_false)) {
+    end_idx <- nrow(traj_x)
+  } else {
+    end_idx <- start_idx + end_false - 2
+  }
+  # return only consecutive moving segment
+  traj_moving <- traj_x[start_idx:end_idx, ]
+  return(traj_moving)
+}
+
+for(nm in traj_names) {
+  
+  cat("Processing", nm, "...\n")
+  
+  # load trajectory
+  traj <- get(nm)
+  
+  # processing pipeline
+  traj <- timeToNextPoint5min(traj)
+  traj <- distToNextPoint5min(traj)
+  traj <- speedToNextPoint5min(traj)
+  traj <- travelling(traj)
+  
+  # extract moving segment
+  traj_moving <- extractMovingSegment(traj)
+  
+  # save objects in workspace
+  assign(nm, traj)
+  assign(paste0(nm, "_moving"), traj_moving)
+  
+  # export to csv
+  write.csv(
+    traj_moving,
+    file = file.path(
+      "Data/Preprocessed",
+      paste0(nm, "_moving.csv")
+    ),
+    row.names = FALSE
+  )
+}
+```
+
+## Code
+
+```{r}
+#| echo: true
+#| fig.show: hide
+#| results: hide
+
+library(tidyr)
+library(readr)
+library(sf)
+library(tmap)
+library(purrr)
+library(ggplot2)
+library(dplyr)
+
+### READ ALL FILES ###
+
+# get all .plt files
+files <- list.files(
+  "Data/Preprocessed",
+  pattern = "\\.csv$",
+  full.names = TRUE
+)
+
+# read all files into seperate variables
+for(i in seq_along(files)) {
+  obj_name <- sprintf("traj_%03d", i)
+  traj <- read_csv(files[i]) 
+  assign(obj_name, traj)
+}
+
+names_traj <- ls(pattern = "^traj_")
+
+# delete empty files and files with one point only
+empty_trajs <- names_traj[sapply(names_traj, function(x) {
+  nrow(get(x)) < 2
+})]
+
+rm(list = empty_trajs)
+names_traj <- ls(pattern = "^traj_")
+
+# convert all to sf object
+for (nm in names_traj) {
+  traj <- get(nm)
+
+  traj_sf <- st_as_sf(
+    traj,
+    coords = c("lon", "lat"),
+    crs = 4326,
+    remove = FALSE
+  )
+
+  assign(nm, traj_sf)
+}
+
+all_traj <- bind_rows(
+  mget(names_traj),
+  .id = "traj_id"
+)
+
+# combine all trajectories
+all_lines <- all_traj %>%
+  arrange(traj_id, datetime) %>%
+  group_by(traj_id) %>%
+  summarise(do_union = FALSE) %>%
+  st_cast("LINESTRING")
+
+
+### TRAJECTORY LENGTH AND DIRECTNESS ###
+
+add_step_distance <- function(traj) {
+  traj <- traj %>%
+    arrange(datetime)
+  # shift geometry to align each point with the next one
+  geom_next <- lead(st_geometry(traj))
+  # compute point-to-next-point distance (meters)
+  traj$step_dist_m <- as.numeric(
+    st_distance(traj, geom_next, by_element = TRUE)
+  )
+  # last point has no next point
+  traj$step_dist_m[is.na(traj$step_dist_m)] <- 0
+  traj
+}
+ 
+# dist to next point
+for (nm in names_traj) {
+  traj <- get(nm)
+  traj <- add_step_distance(traj)
+  assign(nm, traj)
+}
+
+# L0: direct path from A to B
+add_total_distance <- function(traj) {
+  traj <- traj %>%
+    arrange(datetime)
+  first_pt <- traj[1, ]
+  last_pt  <- traj[nrow(traj), ]
+  total_dist <- as.numeric(
+    st_distance(first_pt, last_pt)
+  )
+  traj$direct_dist <- total_dist
+  traj
+}
+
+for (nm in names_traj) {
+  traj <- get(nm)
+  traj <- add_total_distance(traj)
+  assign(nm, traj)
+}
+
+# L1: actual path from A to B
+add_total_path_distance <- function(traj) {
+  traj <- traj %>%
+    arrange(datetime)
+  traj$total_path_dist_m <- sum(traj$step_dist_m, na.rm = TRUE)
+  traj
+}
+
+for (nm in names_traj) {
+  traj <- get(nm)
+  traj <- add_total_path_distance(traj)
+  assign(nm, traj)
+}
+
+# L1/L0: directness of actual path
+for (nm in names_traj) {
+  traj <- get(nm)
+  traj$path_directness <- traj$total_path_dist_m / traj$direct_dist
+  assign(nm, traj)
+}
+
+
+### STATISTICAL ANALYSIS ###
+
+# summarize all trajectories to single data frame
+traj_summary <- data.frame(
+  traj_id = names_traj,
+  total_path_dist_m = NA_real_,
+  direct_dist = NA_real_,
+  path_directness = NA_real_
+)
+
+for (nm in names_traj) {
+  traj <- get(nm)
+  traj_summary$total_path_dist_m[traj_summary$traj_id == nm] <-
+    unique(traj$total_path_dist_m)
+  traj_summary$direct_dist[traj_summary$traj_id == nm] <-
+    unique(traj$direct_dist)
+  traj_summary$path_directness[traj_summary$traj_id == nm] <-
+    unique(traj$path_directness)
+}
+
+# general
+summary(traj_summary)
+
+# plot taken path ~ direct dist
+ggplot(traj_summary, aes(x = direct_dist, y = total_path_dist_m)) +
+ geom_point(alpha = 0.6) +
+ labs(
+   x = "direct distance [m]",
+   y = "actual length of  path [m]"
+ ) +
+ theme_minimal()
+
+# plot directness ~ direct dist
+ggplot(traj_summary, aes(x = direct_dist, y = path_directness)) +
+  geom_point(alpha = 0.6) +
+  labs(
+    x = "direct distance [m]",
+    y = "directness of path = actual length / direct distance"
+  ) +
+  theme_minimal()
+
+# correlation analysis
+ggplot(traj_summary,
+       aes(x = direct_dist,
+           y = path_directness)) +
+  geom_point(alpha = 0.5) +
+   geom_smooth(method = "loess", se = TRUE) +
+   labs(
+     x = "direct distance [m]",
+     y = "directness of path"
+   ) +theme_minimal()
+ 
+ cor.test(traj_summary$direct_dist, traj_summary$path_directness, method = "spearman")
+
+```
 
 ## Abstract
 
+Human mobility is constrained by transportation networks and physical
+barriers, leading to travel paths that deviate from the straight-line
+distance between origins and destinations. This deviation can be
+quantified using trajectory directness, defined as the ratio between
+travelled distance and Euclidean distance. This study investigates
+whether longer journeys exhibit higher directness using a subsample of
+79 trajectories from the GeoLife GPS Trajectories Dataset, which
+contains long-term GPS records from 182 users. For each trajectory,
+total path length and straight-line distance were computed using spatial
+operations in R, and a directness ratio was derived. The relationship
+between journey length and directness was evaluated using Spearman rank
+correlation. Results show a weak but statistically significant negative
+correlation (ρ = -0.297, p = 0.008), indicating that longer journeys
+tend to be more direct. However, substantial variability is observed,
+particularly in short trajectories. This pattern is likely influenced by
+infrastructure effects and preprocessing decisions, including trajectory
+segmentation at pauses longer than five minutes, which may
+differentially affect transport modes. Overall, the findings suggest
+that journey length is associated with increased route efficiency, but
+that measurement and mode-related biases play an important role in
+observed trajectory structure.
+
 ## Introduction
 
-@laube2011 investigate how temporal scale affects the calculation of movement parameters (speed, sinuosity and turning angle) of animal trajectories. 
+Human mobility is a central aspect of everyday life. Although travelers
+often seek efficient routes between origins and destinations, real-world
+trajectories rarely follow the shortest possible path. Instead, movement
+is constrained by transportation networks, topography, and other
+physical barriers, causing travelled distances to exceed the
+straight-line distance between start and end points.
+
+The difference between travelled distance and straight-line distance can
+be used to quantify the *directness* of a trajectory. Directness
+provides a simple measure of how efficiently a journey connects its
+origin and destination.
+
+This study investigates the directness of real-world travel trajectories
+using the GeoLife GPS Trajectories Dataset, a large collection of GPS
+tracks recorded by 182 users over more than five years. For each
+trajectory, travelled distance and straight-line distance are compared
+to calculate a directness ratio. The relationship between journey length
+and directness is then examined. It is hypothesized that longer journeys
+exhibit higher directness than shorter journeys.
 
 ## Material and Methods
 
+The analysis was based on trajectory data from the GeoLife GPS
+Trajectories Dataset (Zheng et al. 2009). To reduce computational
+complexity while retaining a diverse set of movement patterns, a random
+subsample of approximately 100 trajectories was selected for analysis.
+
+Trajectory Preprocessing. Only active travel segments were included in
+the study. Movement was classified as active when the recorded speed
+exceeded 3 km/h over the following five consecutive minutes. Trajectory
+sequences were required to contain a minimum of two GPS observations to
+allow the calculation of movement metrics.
+
+Measures of Trajectory Directness. To quantify the directness of
+movement, three measures were calculated for each trajectory using the R
+package [sf](https://r-spatial.github.io/sf/?utm_source=chatgpt.com)
+(Pebesma, 2023):
+
+1.  **Total trajectory length** – the cumulative distance travelled
+    along the recorded trajectory.
+
+2.  **Direct length** – the straight-line (Euclidean) distance between
+    the trajectory's start and end points.
+
+3.  **Directness ratio** – calculated as the ratio between direct length
+    and total trajectory length:
+
+Directness Ratio = Total Trajectory Length / Direct Length
+
+Values close to 1 indicate highly direct movement, whereas lower values
+indicate more circuitous trajectories. Trajectory directness was used as
+an indicator of movement efficiency, describing how closely observed
+movement paths approximated the shortest possible route between origin
+and destination.
+
+Statistical Analysis. The relationship between trajectory length and
+directness was investigated using Spearman's rank correlation
+coefficient. Spearman's correlation was chosen because it does not
+assume normally distributed variables and is robust to non-linear
+monotonic relationships.
+
+Visualisation. Data exploration and result presentation were conducted
+in R. Scatterplots were created using
+[ggplot2](https://ggplot2.tidyverse.org/?utm_source=chatgpt.com)
+(Wickham, 2016) to visualize relationships between trajectory
+characteristics and directness measures. Spatial representations of
+trajectories were produced using
+[tmap](https://r-tmap.github.io/tmap/?utm_source=chatgpt.com) (Tennekes,
+2024), allowing visual assessment of movement patterns and route
+geometry.
+
+The analysis was done in R (R Core Team, 2025). ChatGPT (OpenAI, 2026)
+was used as a coding assistant.
+
 ## Results
+
+After preprocessing and filtering, 79 trajectories remained for
+analysis. Trajectory lengths varied substantially, ranging from 8.6 m to
+175.6 km. However, the distribution was strongly right-skewed, with most
+trajectories being relatively short (\< 5 km) and only a few
+trajectories exceeding several tens of kilometers. Map 1 shows the
+trajectories that are left after preprocessing:
+
+```{r}
+# visualize
+tmap_mode("view")
+
+tm_shape(all_lines) +
+  tm_lines(col = "traj_id", lwd = 1, legend.show = FALSE) +
+  #tm_basemap("OpenStreetMap", alpha = 0.4) +
+  tm_layout(
+    legend.show = FALSE,
+    frame = TRUE
+  )
+```
+
+Map 1: All 79 trajectories left after preprocessing.
+
+Trajectory directness ranged from 1.0 to 5.6, with a median value of
+1.40 and a mean of 1.62. Most trajectories exhibited directness values
+between 1 and 2, indicating that travelled distances were typically only
+moderately longer than the corresponding straight-line distances. Highly
+indirect trajectories (directness \> 2) were rare and occurred
+exclusively among very short trajectories (\< 200 m).
+
+```{r}
+#| echo: false
+summary(traj_summary)
+
+# plot taken path ~ direct dist
+ggplot(traj_summary, aes(x = direct_dist, y = total_path_dist_m)) +
+  geom_point(alpha = 0.6) +
+  labs(
+    x = "direct distance [m]",
+    y = "actual length of  path [m]"
+  ) +
+  theme_minimal()
+
+# plot directness ~ direct dist
+ggplot(traj_summary, aes(x = direct_dist, y = path_directness)) +
+  geom_point(alpha = 0.6) +
+  labs(
+    x = "direct distance [m]",
+    y = "directness of path = actual length / direct distance"
+  ) +
+  theme_minimal()
+```
+
+A Spearman rank correlation analysis revealed a weak but statistically
+significant negative relationship between direct distance and trajectory
+directness (ρ = -0.297, p = 0.008). Thus, trajectories with larger
+origin–destination distances tended to be more direct than shorter
+trajectories. This finding supports the hypothesis that longer journeys
+exhibit greater directness.
+
+```{r}
+#| echo: false
+cor.test(traj_summary$direct_dist, traj_summary$path_directness, method = "spearman")
+```
+
+Visual inspection of the scatterplot further confirmed this pattern.
+While short trajectories showed a wide range of directness values,
+longer trajectories were consistently characterized by lower directness
+values and clustered close to the minimum possible value of 1.
 
 ## Discussion
 
-## Appendix
+The results support the hypothesis that longer journeys are more direct,
+with a weak but significant negative correlation between direct distance
+and trajectory directness (ρ = -0.297, p = 0.008). However, the
+relationship is highly scattered, indicating that journey length alone
+is a limited predictor of route efficiency.
+
+A likely explanation is that longer trips provide access to more
+efficient, infrastructure-driven routes (e.g., highways or rail
+networks), increasing optimization opportunities over larger spatial
+scales. In contrast, short-distance movement is more affected by local
+constraints and detours, leading to higher variability in directness.
+
+Several methodological factors may also bias the results. Trajectories
+were split at pauses longer than five minutes, which may fragment trips
+containing layovers (e.g., train transfers or EV charging) and remove
+intermediate detours. This likely inflates directness estimates and
+reduces observed path length.
+
+This bias is not uniform across transport modes: public transport and
+electric vehicles are more likely to include long stops, whereas
+walking, cycling, and conventional car travel are less affected. As a
+result, apparent differences in directness may partly reflect
+segmentation artefacts rather than true movement efficiency.
+
+Overall, while the hypothesis is supported, trajectory directness is
+strongly influenced by data preprocessing and transport-mode
+composition, limiting direct interpretation of efficiency alone.
+
+## References
+
+R Core Team. (2025). *R: A language and environment for statistical
+computing* (Version 4.5.1) \[Computer software\]. R Foundation for
+Statistical Computing. <https://www.r-project.org/>
+
+Wickham, H. (2016). *ggplot2: Elegant graphics for data analysis*.
+Springer. <https://ggplot2.tidyverse.org/>
+
+Pebesma, E. (2023). *sf: Simple features for R*.
+<https://r-spatial.github.io/sf/>
+
+Tennekes, M. (2024). *tmap: Thematic maps in R*.
+<https://r-tmap.github.io/tmap/>
+
+OpenAI. (2026). *ChatGPT (June 8, 2026 version)* \[Large language
+model\]. <https://chat.openai.com/>
+
+Zheng, Y., Li, Q., Chen, Y., Xie, X., & Ma, W.-Y. (2009). *Understanding
+mobility based on GPS data* (GeoLife project). Microsoft Research Asia.
+<https://www.microsoft.com/en-us/research/publication/understanding-mobility-based-on-gps-data/>
 
 ### Wordcount
 
 <!-- after installing the wordcountadding, remove the line "#| eval: false" -->
 
 ```{r}
-#| eval: false
-wordcountaddin::word_count("index.qmd")
+# wordcountaddin:word_count("index.qmd")
+text <- paste(readLines("index.qmd", warn = FALSE), collapse = " ")
+word_count <- length(strsplit(text, "\\s+")[[1]])
+word_count
 ```
-
-
